@@ -107,13 +107,17 @@ jobs:
           ./mvnw -B -ntp -DskipTests -Dmaven.test.skip=true clean package
           ls -la target/webgoat-*.jar
 
+      # The fat JAR starts BOTH WebGoat and WebWolf embedded servers. They must
+      # bind DIFFERENT ports or the second fails with "Port 8080 already in use"
+      # (observed 2026-08-11). Pin WebGoat to 8080 and WebWolf to 9090 explicitly.
       - name: Boot WebGoat (loopback only)
         run: |
           jar=$(ls target/webgoat-*.jar | head -1)
           nohup java -Dfile.encoding=UTF-8 \
             --add-opens java.base/java.lang=ALL-UNNAMED \
             --add-opens java.base/java.util=ALL-UNNAMED \
-            -jar "$jar" --server.address=127.0.0.1 --server.port=8080 \
+            -jar "$jar" --server.address=127.0.0.1 \
+            --webgoat.port=8080 --webwolf.port=9090 \
             > "$REPORT_DIR/webgoat.log" 2>&1 &
           echo "WEBGOAT_PID=$!" >> "$GITHUB_ENV"
 

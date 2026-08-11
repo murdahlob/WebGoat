@@ -1,0 +1,244 @@
+name: Code Audit (DAST) - WebGoat
+
+# PHASE-3 DAST WORKFLOW (target 3, WebGoat / Java) — PLAN-008 / ADR-007.
+# Ground truth: docs/plans/PLAN-008-ground-truth-webgoat.md.
+#
+# =========================================================================
+#  WebGoat DAST BOOTSTRAP (new; the scanner invocations are ported from the
+#  proven DVWA / NodeGoat audit-dast.yml). Unlike DVWA's setup+level+CSRF dance,
+#  WebGoat's auth flow is REGISTER-THEN-LOGIN (Spring Security form login):
+#     1. Build the runnable JAR (`./mvnw -DskipTests package`) — WebGoat's
+#        Dockerfile packages target/webgoat-*.jar, and building it also proves
+#        the Maven build works (the same build CodeQL depends on).
+#     2. Boot on loopback: java -jar ... --server.address=127.0.0.1
+#        WebGoat listens on 127.0.0.1:8080 at context path /WebGoat
+#        (application-webgoat.properties: WEBGOAT_PORT:8080, WEBGOAT_CONTEXT:/WebGoat).
+#        WebWolf (:9090) is NOT started — out of scope unless a lesson sink needs
+#        it (PLAN-008 §4).
+#     3. Register a throwaway user: POST /WebGoat/register.mvc
+#        (username, password, matchingPassword, agree=agree) — WebGoat allows open
+#        self-registration and starts a session.
+#     4. Log in: POST /WebGoat/login (username, password) -> JSESSIONID.
+#     5. Hand the authenticated JSESSIONID to ZAP / Nuclei / Nikto and exclude
+#        /WebGoat/logout so a scanner does not throw the session away mid-scan.
+#
+#  REVIEW ITEM: a ZAP Automation-Framework form-auth plan (as in NodeGoat's
+#  audit-dast.yml) with poll-based re-auth is more robust than static-cookie
+#  injection and is the recommended upgrade if the cookie approach drifts.
+# =========================================================================
+#
+# SAFETY — WebGoat is INTENTIONALLY VULNERABLE (that is the entire point).
+#   * `workflow_dispatch` only — never on push/PR.
+#   * The scanned URL is HARDCODED to http://127.0.0.1:8080/WebGoat inside the
+#     runner and is NOT an input, so this workflow cannot be pointed elsewhere.
+#   * The app is NEVER exposed; it binds the runner's own loopback and the runner
+#     is destroyed at job end.
+#   * Nuclei runs with `-ni` (interactsh disabled) so no OAST callbacks leave the
+#     runner.
+#
+# DAST reports are run artifacts only, NOT Security-tab uploads (runtime URL
+# findings, not source lines).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_zap_baseline:
+        description: "ZAP baseline (passive) scan"
+        required: false
+        default: true
+        type: boolean
+      run_zap_full:
+        description: "ZAP full ACTIVE scan (sends attack payloads)"
+        required: false
+        default: true
+        type: boolean
+      run_nuclei:
+        description: "Nuclei"
+        required: false
+        default: true
+        type: boolean
+      run_nikto:
+        description: "Nikto"
+        required: false
+        default: true
+        type: boolean
+      zap_spider_minutes:
+        description: "Minutes ZAP may spend spidering (per scan)"
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-dast-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_URL: "http://127.0.0.1:8080"
+  CONTEXT: "/WebGoat"
+  REPORT_DIR: dast-reports
+  WG_USER: dastuser
+  WG_PASS: DastPass123!
+
+jobs:
+  dast:
+    name: DAST - ZAP / Nuclei / Nikto
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare report directory
+        run: |
+          mkdir -p "$REPORT_DIR"
+          chmod 777 "$REPORT_DIR"
+
+      - name: Set up JDK 25 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build the WebGoat JAR
+        run: |
+          ./mvnw -B -ntp -DskipTests -Dmaven.test.skip=true clean package
+          ls -la target/webgoat-*.jar
+
+      - name: Boot WebGoat (loopback only)
+        run: |
+          jar=$(ls target/webgoat-*.jar | head -1)
+          nohup java -Dfile.encoding=UTF-8 \
+            --add-opens java.base/java.lang=ALL-UNNAMED \
+            --add-opens java.base/java.util=ALL-UNNAMED \
+            -jar "$jar" --server.address=127.0.0.1 --server.port=8080 \
+            > "$REPORT_DIR/webgoat.log" 2>&1 &
+          echo "WEBGOAT_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for the application to respond
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fsS -o /dev/null "$BASE_URL$CONTEXT/login"; then
+              echo "App is up after ${i}s"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::WebGoat did not respond on $BASE_URL$CONTEXT/login within 360s"
+          tail -80 "$REPORT_DIR/webgoat.log" || true
+          exit 1
+
+      - name: Register a throwaway user and log in
+        id: auth
+        run: |
+          jar="$RUNNER_TEMP/session.txt"; : > "$jar"
+          # Open registration (WebGoat allows self-registration).
+          curl -sS -c "$jar" -b "$jar" -o /dev/null \
+            --data-urlencode "username=${WG_USER}" \
+            --data-urlencode "password=${WG_PASS}" \
+            --data-urlencode "matchingPassword=${WG_PASS}" \
+            --data-urlencode "agree=agree" \
+            "$BASE_URL$CONTEXT/register.mvc" || true
+          # Form login (Spring Security) -> fresh JSESSIONID in the jar.
+          curl -sS -c "$jar" -b "$jar" -o /dev/null \
+            --data-urlencode "username=${WG_USER}" \
+            --data-urlencode "password=${WG_PASS}" \
+            "$BASE_URL$CONTEXT/login" || true
+          # Confirm the session reaches an authenticated page.
+          code=$(curl -sS -b "$jar" -o /dev/null -w '%{http_code}' "$BASE_URL$CONTEXT/welcome.mvc")
+          echo "GET /welcome.mvc with session -> HTTP $code"
+          jsid=$(sed -n 's/.*JSESSIONID\s*//p' "$jar" | tail -1 | tr -d '\r')
+          echo "JSESSIONID captured: ${jsid:0:6}... (len ${#jsid})"
+          echo "jsessionid=${jsid}" >> "$GITHUB_OUTPUT"
+          cp "$jar" "$REPORT_DIR/session-cookies.txt"
+          if [ "$code" != "200" ]; then
+            echo "::warning::authenticated GET returned HTTP $code - register/login may need review (ZAP AF form-auth plan is the robust upgrade)"
+          fi
+
+      - name: ZAP baseline scan (passive)
+        if: inputs.run_zap_baseline
+        continue-on-error: true
+        env:
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
+          JSID: ${{ steps.auth.outputs.jsessionid }}
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$BASE_URL$CONTEXT" -m "$ZAP_SPIDER_MINUTES" \
+              -z "replacer.full_list(0).description=auth \
+                  replacer.full_list(0).enabled=true \
+                  replacer.full_list(0).matchtype=REQ_HEADER \
+                  replacer.full_list(0).matchstr=Cookie \
+                  replacer.full_list(0).replacement=JSESSIONID=${JSID}" \
+              -r zap-baseline.html -J zap-baseline.json -x zap-baseline.xml -w zap-baseline.md -I
+
+      - name: ZAP full scan (ACTIVE)
+        if: inputs.run_zap_full
+        continue-on-error: true
+        env:
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
+          JSID: ${{ steps.auth.outputs.jsessionid }}
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t "$BASE_URL$CONTEXT" -m "$ZAP_SPIDER_MINUTES" \
+              -z "replacer.full_list(0).description=auth \
+                  replacer.full_list(0).enabled=true \
+                  replacer.full_list(0).matchtype=REQ_HEADER \
+                  replacer.full_list(0).matchstr=Cookie \
+                  replacer.full_list(0).replacement=JSESSIONID=${JSID}" \
+              -r zap-full.html -J zap-full.json -x zap-full.xml -w zap-full.md -I
+
+      - name: Nuclei scan
+        if: inputs.run_nuclei
+        continue-on-error: true
+        env:
+          JSID: ${{ steps.auth.outputs.jsessionid }}
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/reports:rw" \
+            projectdiscovery/nuclei:latest \
+              -target "$BASE_URL$CONTEXT" -ni -no-color -stats \
+              -H "Cookie: JSESSIONID=${JSID}" \
+              -jsonl-export /reports/nuclei.jsonl -sarif-export /reports/nuclei.sarif -output /reports/nuclei.txt
+
+      - name: Nikto scan (JSON)
+        if: inputs.run_nikto
+        continue-on-error: true
+        env:
+          JSID: ${{ steps.auth.outputs.jsessionid }}
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/output:rw" \
+            ghcr.io/sullo/nikto:latest \
+              -h "$BASE_URL$CONTEXT" -maxtime 15m \
+              -id "JSESSIONID=${JSID}" \
+              -Format json -o /output/nikto.json
+
+      - name: Collect application log
+        if: always()
+        run: tail -200 "$REPORT_DIR/webgoat.log" > "$REPORT_DIR/app.log" 2>&1 || true
+
+      - name: Stop application
+        if: always()
+        run: kill "${WEBGOAT_PID}" 2>/dev/null || true
+
+      - name: Verify each enabled tool produced a report
+        if: always()
+        run: |
+          check() { [ "$2" != "true" ] && return 0; [ -s "$REPORT_DIR/$3" ] || echo "::warning::$1 enabled but produced no $3"; }
+          check "ZAP baseline"  "${{ inputs.run_zap_baseline }}" zap-baseline.json
+          check "ZAP full scan" "${{ inputs.run_zap_full }}"     zap-full.json
+          check "Nuclei"        "${{ inputs.run_nuclei }}"       nuclei.jsonl
+          check "Nikto"         "${{ inputs.run_nikto }}"        nikto.json
+
+      - name: Upload DAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: ${{ env.REPORT_DIR }}/
+          if-no-files-found: warn

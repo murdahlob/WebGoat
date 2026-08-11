@@ -1,0 +1,158 @@
+name: CodeQL (SAST) - WebGoat (Java)
+
+# ============================ THE LOAD-BEARING NEW WORK ======================
+# On DVWA (PHP) CodeQL was N/A — no PHP extractor. On WebGoat CodeQL Java IS
+# supported and IS the headline per-ecosystem cost PLAN-004/PLAN-008 flagged:
+# Java is COMPILED, so the CodeQL database needs a real build. If the Maven build
+# fails in the runner, CodeQL produces NOTHING, so the build is the single
+# highest-risk step (PLAN-008 §2). A non-building analyzer run passes VACUOUSLY
+# (the EIL `dotnet format` lesson) — so this workflow ASSERTS the build produced
+# classes before trusting CodeQL.
+#
+# BUILD DESIGN — manual build, not autobuild (deliberate).
+#   * This WebGoat pin is a SINGLE-MODULE Maven project (one pom.xml), so
+#     `./mvnw compile` is deterministic; the multi-module-reactor risk PLAN-008
+#     worried about does not exist here.
+#   * The project targets **Java 25** (pom: <java.version>25</java.version>,
+#     Spring Boot 4.1.0). Java 25 is very new, so we PIN the JDK with
+#     actions/setup-java (temurin 25) rather than trust the runner default or
+#     autobuild's JDK selection. This is the "manual ./mvnw fallback" PLAN-008
+#     names, promoted to primary because it lets us pin the JDK AND assert the
+#     build succeeded — the two things autobuild cannot give us here.
+#   * If CodeQL's Java extractor cannot parse Java 25 source at the runner's
+#     bundle version, that is itself a reportable finding (the Java analogue of
+#     DVWA's "CodeQL has no PHP extractor") — the assert + manifest capture it.
+#
+# `security-extended` is selected deliberately: the point of CodeQL is the
+# deepest free taint analysis available, and WebGoat's planted flaws (SQLi, XXE,
+# insecure deserialization, SSRF, path traversal, JWT) are exactly the
+# taint-tracking queries the extended suite adds. Record which of the ground-truth
+# rows its rules actually reach.
+#
+# LICENCE NOTE (ADR-009): WebGoat's LICENSE.txt declares
+# `SPDX-License-Identifier: GPL-2.0-or-later` — an OSI-approved licence, so the
+# codebase is an "Open Source Codebase" under the CodeQL Terms. (GitHub's repo
+# API reports NOASSERTION only because the licence file carries a custom OWASP
+# preamble; the SPDX tag is explicit.) Hosted action + Security-tab upload on a
+# PUBLIC repo is the licensed route.
+# ============================================================================
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: CodeQL - java-kotlin
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin JDK 25 (the pom's <java.version>) so the Maven build and CodeQL's
+      # tracer both run on the version the project actually targets.
+      - name: Set up JDK 25 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java-kotlin
+          # manual build-mode: we drive the Maven compile ourselves (see header).
+          build-mode: manual
+          queries: security-extended
+
+      # The build. -DskipTests + -Dmaven.test.skip skips both running AND
+      # compiling tests (we only need src/main compiled for the CodeQL DB). Not
+      # continue-on-error: a build failure MUST surface — a green-but-empty CodeQL
+      # run is the vacuous pass we are guarding against.
+      - name: Build (Maven compile, main only)
+        id: build
+        run: |
+          ./mvnw -B -ntp -DskipTests -Dmaven.test.skip=true clean compile
+
+      # Guard: assert the compile actually produced classes. If target/classes is
+      # empty the CodeQL DB would be empty and every "0 findings" downstream would
+      # be meaningless.
+      - name: Assert build produced classes
+        run: |
+          n=$(find target/classes -name '*.class' 2>/dev/null | wc -l)
+          echo "compiled .class files: $n"
+          if [ "${n:-0}" -lt 50 ]; then
+            echo "::error::Maven compile produced $n class files (<50) - CodeQL DB would be vacuous. Failing so a non-building CodeQL run is not mistaken for a clean scan."
+            exit 1
+          fi
+
+      - name: CodeQL analyze
+        id: codeql-analyze
+        continue-on-error: true          # a scanner failure must not sink the run
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql
+          output: codeql-results
+          upload: always
+
+      - name: Collect CodeQL SARIF
+        if: always()
+        run: |
+          cp codeql-results/*.sarif codeql.sarif 2>/dev/null \
+            || echo "::warning::CodeQL produced no SARIF - check the analyze step log"
+          if [ -s codeql.sarif ]; then
+            {
+              echo "## CodeQL (Java)"
+              echo ""
+              echo "results: $(jq '[.runs[].results[]?] | length' codeql.sarif)"
+              echo "rules:   $(jq '.runs[0].tool.driver.rules | length' codeql.sarif)"
+              echo "app-only (src/main/): $(jq '[.runs[].results[]? | select((.locations[0].physicalLocation.artifactLocation.uri // \"\") | startswith(\"src/main/\"))] | length' codeql.sarif)"
+              echo "scanned SHA: \`${GITHUB_SHA}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Record run manifest (CodeQL)
+        if: always()
+        run: |
+          {
+            echo "# CodeQL run manifest (WebGoat / Java)"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo "action:       github/codeql-action@v3"
+            echo "language:     java-kotlin (build-mode: manual, ./mvnw compile)"
+            echo "jdk:          temurin 25 (pom <java.version>25</java.version>)"
+            echo "compiled classes: $(find target/classes -name '*.class' 2>/dev/null | wc -l)"
+            echo "query suite:  security-extended"
+            echo "bundle:       $("${{ steps.codeql-init.outputs.codeql-path }}" version --format=terse 2>/dev/null || echo 'n/a')"
+          } > run-manifest-codeql.txt
+          cat run-manifest-codeql.txt
+
+      - name: Upload CodeQL SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-codeql
+          path: |
+            codeql.sarif
+            run-manifest-codeql.txt
+          if-no-files-found: warn

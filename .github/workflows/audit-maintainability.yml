@@ -1,0 +1,117 @@
+name: Code Audit (maintainability / design) - WebGoat
+
+# PHASE-3 SCANNING WORKFLOW (target 3, WebGoat / Java-Maven) — PLAN-008 / ADR-007.
+# Ground truth: docs/plans/PLAN-008-ground-truth-webgoat.md.
+#
+# =========================== THE MAINTAINABILITY COLUMN STILL HALVES =========
+# This is the CROSS-ECOSYSTEM finding PLAN-008 predicted: unlike SCA (which came
+# back on Maven), the maintainability halving is NOT PHP-specific — it recurs on
+# Java. NodeGoat's maintainability layer had FOUR instruments; on Java, as on PHP,
+# only TWO survive:
+#
+#   * jscpd              — language-agnostic duplication detector, supports Java.  RUNS.
+#   * SonarQube          — has a Java analyzer (code smells, complexity,
+#                          maintainability rating).                                RUNS (sonar-export.yml,
+#                                                                                  an owner's SaaS step).
+#   * knip               — JavaScript/TypeScript ONLY (unused exports/files/deps
+#                          from an ES/TS module graph). NO Java support.           N/A.
+#   * dependency-cruiser — JavaScript/TypeScript ONLY (walks import/require
+#                          module graphs). NO Java support.                        N/A.
+#
+# So the same two JS-only design instruments are gone on Java too — confirming
+# that the maintainability shrink IS cross-ecosystem (whereas SCA's PHP collapse
+# was PHP-specific). knip and dependency-cruiser are intentionally ABSENT with
+# this header recording WHY, so their absence reads as a finding, not a gap.
+#
+# Self-checkout; jscpd runs via `npx jscpd@4` on the runner's preinstalled Node
+# (the `ghcr.io/kucherenko/jscpd` image is dead — DVWA note). Application scope
+# keeps `src/main/**` and excludes build output, tests and the CI harness.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-maintainability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------- duplication
+  jscpd:
+    name: Design - jscpd (duplication)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # WebGoat's lessons share a lot of boilerplate (each AssignmentEndpoint has
+      # the same success/failure ResponseEntity shape), so some duplication is
+      # expected. Scope to src/main/java Java sources; exclude tests, target build
+      # output and the CI harness so their noise does not swamp the signal.
+      - name: jscpd scan (Java, application only)
+        continue-on-error: true
+        run: |
+          npx --yes jscpd@4 . \
+            --pattern "src/main/**/*.java" \
+            --ignore "**/target/**,**/src/test/**,**/.github/**" \
+            --reporters json,markdown,console \
+            --output jscpd-report \
+            --mode mild || true
+          ls -la jscpd-report || true
+
+      - name: Verify jscpd produced a parseable report
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f is missing or empty - jscpd did not run or analyzed zero files"
+            exit 1
+          fi
+          sources=$(jq -r '.statistics.total.sources // 0' "$f")
+          clones=$(jq -r '(.duplicates | length) // 0' "$f")
+          echo "jscpd analyzed $sources Java file(s) and found $clones clone pair(s)"
+          if [ "$sources" -eq 0 ]; then
+            echo "::error::jscpd analyzed 0 files - config wrong (this is a null result, not a clean run)"
+            exit 1
+          fi
+
+      - name: Summarise jscpd
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          {
+            echo "## jscpd (duplication) - WebGoat"
+            echo ""
+            echo "- sources analyzed: **$(jq -r '.statistics.total.sources // 0' "$f")**"
+            echo "- clone pairs: **$(jq -r '(.duplicates | length) // 0' "$f")**"
+            echo "- duplicated lines: **$(jq -r '.statistics.total.duplicatedLines // 0' "$f")** / $(jq -r '.statistics.total.lines // 0' "$f") ($(jq -r '.statistics.total.percentage // 0' "$f")%)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (jscpd)
+        if: always()
+        run: |
+          {
+            echo "## jscpd"
+            echo "runner: npx jscpd@4 (node on ubuntu-latest; ghcr image retired)"
+            echo "pattern: src/main/**/*.java  ignore: target/, src/test/, .github/"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > jscpd-report/manifest-jscpd.txt
+
+      - name: Upload jscpd report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainability-jscpd
+          path: jscpd-report/
+          if-no-files-found: error
+
+  # knip and dependency-cruiser are deliberately NOT jobs here — they are
+  # JavaScript/TypeScript-only and have no Java support. Their absence is the
+  # finding (see the header). SonarQube's Java analyzer runs as a separate
+  # platform workflow (sonar-export.yml, owner's step).

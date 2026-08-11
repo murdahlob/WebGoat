@@ -1,0 +1,299 @@
+name: Code Audit (static SAST) - WebGoat
+
+# PHASE-3 SCANNING WORKFLOW (target 3, WebGoat / Java-Maven) — see the planning
+# repo's PLAN-008 (WebGoat execution) and ADR-007 (why the scanning workflows
+# live in the fork rather than the evaluation repo). Ground truth:
+# docs/plans/PLAN-008-ground-truth-webgoat.md, pinned commit
+# c596b729866792d0e5b73330948713d5852b5ec6.
+#
+# This is the Java adaptation of the DVWA audit-static.yml. Per PLAN-008 §2 the
+# SAST layer changes as a pack swap: Semgrep `p/java` (replacing `p/php`), plus
+# the generic security packs. Snyk Code is Java-aware (needs SNYK_TOKEN). CodeQL
+# Java — unlike PHP, where it was N/A — DOES run and is the headline new plumbing;
+# it lives in codeql.yml (it needs a real Maven build). SonarQube (Java analyzer)
+# is a platform run in sonar-export.yml.
+#
+# Self-checkout: this scans THIS repository's own tree, so SARIF paths resolve
+# and results reach the Security tab. SARIF is published twice (Security tab +
+# run artifact) per ADR-002.
+#
+# APPLICATION-ONLY SCOPE. WebGoat is a single-module Maven project. Application
+# code lives under `src/main/**` (Java lessons + resources); the CI harness is
+# `.github/**`, the build output is `target/**`, and the tests are `src/test/**`.
+# Application-only counts keep only `src/main/**`. Filtering is done at SCORING
+# time over the SARIF, not at the scanner, so the raw output stays comparable
+# across baselines (the phase-1 lesson: never let scanner-side filtering make the
+# raw output disagree with the reported numbers). Semgrep is additionally told to
+# skip target/ and test dirs so its scan time is not wasted on build output.
+#
+# Nothing here builds the project or runs any Java. DAST is audit-dast.yml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: audit-static-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- Semgrep
+  semgrep:
+    name: SAST - Semgrep (p/java)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker run rather than a container job, same reason as DVWA/NodeGoat: the
+      # semgrep/semgrep image is Alpine/musl and cannot host the glibc Node that
+      # the JavaScript actions (checkout / upload-sarif) need. Keep the scanner in
+      # a plain step and leave those actions on the host runner.
+      #
+      # Rule packs: the generic security packs plus `p/java` — the pack that
+      # matches this stack, replacing DVWA's `p/php`.
+      - name: Semgrep scan
+        continue-on-error: true
+        run: |
+          docker run --rm --user 0 \
+            -v "${PWD}:/src" -w /src \
+            semgrep/semgrep \
+            semgrep scan \
+              --config p/default \
+              --config p/security-audit \
+              --config p/secrets \
+              --config p/owasp-top-ten \
+              --config p/java \
+              --exclude target --exclude 'src/test' \
+              --metrics off \
+              --sarif --output /src/semgrep.sarif
+
+      - name: Record run-manifest fragment (Semgrep)
+        if: always()
+        run: |
+          {
+            echo "## semgrep"
+            echo "image:   $(docker image inspect --format '{{index .RepoDigests 0}}' semgrep/semgrep 2>/dev/null || echo 'not pulled')"
+            echo "version: $(docker run --rm semgrep/semgrep semgrep --version 2>/dev/null || echo 'n/a')"
+            echo "packs:   p/default p/security-audit p/secrets p/owasp-top-ten p/java"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-semgrep.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-semgrep
+          path: manifest-semgrep.txt
+          if-no-files-found: warn
+
+      - name: Upload Semgrep SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+  # ----------------------------------------------- Snyk Code (needs SNYK_TOKEN)
+  # Snyk Code is language-aware SAST and supports Java. Gated on the SNYK_TOKEN
+  # repository secret existing (a human owner's step). Safe here: it checks out
+  # code we own and host and never builds or runs the dependency tree, so the
+  # secret never shares a job with third-party code execution.
+  #
+  # `snyk code test --sarif-file-output=` writes SARIF and exits non-zero when it
+  # finds issues, hence continue-on-error. Note (per PLAN-004 english-vocab
+  # scorecard): Snyk emits a SARIF rule only for a rule that FIRED, so a clean
+  # scan yields a valid zero-rule SARIF — a rule-count liveness check is WRONG for
+  # Snyk. Liveness comes from the CLI's own exit status / the artifact existing.
+  snyk-code:
+    name: SAST - Snyk Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # Self-checkout the PINNED scanned commit (not the dispatched ref) so the
+      # Snyk Code scan analyses exactly the ground-truth tree.
+      - uses: actions/checkout@v4
+        with:
+          ref: c596b729866792d0e5b73330948713d5852b5ec6
+
+      - uses: snyk/actions/setup@master
+
+      # APPLICATION-ONLY SCOPE. Exclude the build output (target/**), tests
+      # (src/test/**) and the CI harness (.github/**) from Snyk Code. A .snyk
+      # policy file's `exclude.global` globs are honoured by the Snyk CLI. Written
+      # at runtime (not committed) because the pinned checkout replaces the tree
+      # with the c596b72 commit, which carries no .snyk file.
+      - name: Scope Snyk to application code
+        run: |
+          cat > .snyk <<'EOF'
+          # Snyk policy file - exclude build output, tests and CI harness
+          version: v1.0.0
+          exclude:
+            global:
+              - target/**
+              - src/test/**
+              - .github/**
+          EOF
+          echo "wrote .snyk:"; cat .snyk
+
+      - name: Snyk Code test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          # Diagnostic: token LENGTH only (never the value). Distinguishes an
+          # empty/unset secret (0) from a present-but-invalid token (>0).
+          echo "SNYK_TOKEN length: ${#SNYK_TOKEN}"
+          snyk code test --sarif-file-output=snyk-code.sarif
+
+      - name: Record run-manifest fragment (Snyk Code)
+        if: always()
+        run: |
+          {
+            echo "## snyk code"
+            echo "cli version: $(snyk --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-snyk-code.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-snyk-code
+          path: manifest-snyk-code.txt
+          if-no-files-found: warn
+
+      - name: Upload Snyk Code SARIF to Security tab
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk Code SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-snyk-code
+          path: snyk-code.sarif
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------- aggregation
+  summary:
+    name: Findings summary
+    runs-on: ubuntu-latest
+    needs: [ semgrep, snyk-code ]
+    if: always()
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif
+          merge-multiple: true
+
+      - name: Count findings per SARIF file (whole-tree and application-only)
+        run: |
+          {
+            echo "## Static SAST summary (WebGoat)"
+            echo ""
+            echo "Scanned repo: \`${GITHUB_REPOSITORY}\`"
+            echo "Scanned SHA:  \`${GITHUB_SHA}\`"
+            echo ""
+            echo "Application-only keeps only \`src/main/**\` (the Java lessons +"
+            echo "resources); it excludes \`.github/**\`, \`target/**\` and \`src/test/**\`."
+            echo ""
+            echo "| SARIF file | whole-tree | application-only |"
+            echo "|---|---|---|"
+            shopt -s nullglob
+            for f in sarif/*.sarif; do
+              n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "parse error")
+              a=$(jq '[.runs[].results[]
+                       | select((.locations[0].physicalLocation.artifactLocation.uri // "")
+                                 | startswith("src/main/"))]
+                      | length' "$f" 2>/dev/null || echo "parse error")
+              echo "| $(basename "$f") | ${n} | ${a} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Semgrep emits its full loaded ruleset regardless of findings, so a
+      # rule-count liveness check is valid FOR SEMGREP ONLY. Snyk emits rules only
+      # for findings (a clean scan is a valid zero-rule SARIF) — do NOT rule-count
+      # Snyk (PLAN-004 english-vocab scorecard). Snyk liveness is its artifact
+      # existing.
+      - name: Verify expected SARIF was produced
+        run: |
+          fail=0
+          f=sarif/semgrep.sarif
+          if [ ! -s "$f" ]; then
+            echo "::error::semgrep.sarif is missing or empty - the scanner failed silently"
+            fail=1
+          else
+            rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+            [ "${rules:-0}" -eq 0 ] && { echo "::error::semgrep.sarif loaded zero rules"; fail=1; }
+          fi
+          if [ ! -f sarif/snyk-code.sarif ]; then
+            echo "::warning::snyk-code.sarif absent - Snyk Code did not run (SNYK_TOKEN unset?) or failed; check the snyk-code job"
+          fi
+          exit "$fail"
+
+      - name: Download run-manifest fragments
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifest
+          merge-multiple: true
+
+      - name: Assemble run manifest
+        if: always()
+        run: |
+          {
+            echo "# Static SAST run manifest (WebGoat)"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo ""
+            cat manifest/*.txt 2>/dev/null || echo "no per-job fragments recovered"
+          } > run-manifest.txt
+          cat run-manifest.txt
+
+      - name: Upload run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.txt
+          if-no-files-found: warn
+
+      - name: Re-upload combined SARIF bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-all
+          path: sarif/
+          if-no-files-found: warn

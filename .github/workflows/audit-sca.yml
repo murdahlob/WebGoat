@@ -1,0 +1,381 @@
+name: Code Audit (SCA + secrets) - WebGoat
+
+# PHASE-3 SCANNING WORKFLOW (target 3, WebGoat / Java-Maven) — PLAN-008 / ADR-007.
+# Ground truth: docs/plans/PLAN-008-ground-truth-webgoat.md.
+#
+# ============================ SCA COMES BACK, RICHLY ========================
+# The mirror image of DVWA. On flat PHP the SCA column collapsed to ~0 (no
+# manifest). WebGoat is a real single-module Maven project WITH a `pom.xml`, and
+# it deliberately ships KNOWN-VULNERABLE dependencies for its "Vulnerable
+# Components (A06)" lesson — notably **xstream 1.4.5** (2014, a long list of
+# deserialization RCE CVEs), **commons-collections 3.2.1** (the ysoserial gadget),
+# **jjwt 0.9.1**, **xml-resolver 1.2**. So there ARE genuine `sca` ground-truth
+# rows here, and this is the clearest "SCA generalises past npm" data point in the
+# trial (PLAN-008 §2). Expect OSV / Trivy / Dependabot / Dependency-Check to light
+# up on xstream in particular.
+# ===========================================================================
+#
+# Layout per PLAN-008 §4: OSV-Scanner (recursive over pom.xml) + Trivy (fs:
+# vuln,secret,misconfig — Trivy resolves Maven coordinates from pom.xml) + **OWASP
+# Dependency-Check** (the `npm audit` / `composer audit` analogue that DVWA had NO
+# equivalent for) + gitleaks. Dependency-Check sees real dependency JARs, so this
+# workflow does a light `dependency:copy-dependencies` first (it needs a JDK; that
+# same JDK-25 setup is what CodeQL needs too).
+#
+# Self-checkout, SARIF twice (Security tab + artifact, ADR-002). Application-only
+# scoring keeps `src/main/**`; SCA advisories are about dependencies, not app
+# files, so they are counted as-is. Nothing runs the application.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: audit-sca-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- OSV
+  osv-scanner:
+    name: SCA - OSV-Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recursive so it finds the root pom.xml (the only manifest) and resolves
+      # its Maven coordinates against the OSV database. Pinned action release.
+      - name: Run OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv.sarif
+            ./
+
+      - name: Record run-manifest fragment (OSV-Scanner)
+        if: always()
+        run: |
+          {
+            echo "## osv-scanner"
+            echo "action: google/osv-scanner-action/osv-scanner-action@v2.3.8"
+            echo "note:   resolves the root pom.xml Maven coordinates"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-osv.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-osv
+          path: manifest-osv.txt
+          if-no-files-found: warn
+
+      - name: Upload OSV SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+
+      - name: Upload OSV SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-osv-scanner
+          path: osv.sarif
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- Trivy
+  trivy:
+    name: SCA + secrets + misconfig - Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # WebGoat carries a Dockerfile at the repo root, so Trivy's `misconfig`
+      # scanner has a container file to analyse; `secret` scans the tree; `vuln`
+      # resolves the pom.xml Maven deps. Budget for Trivy's vuln-DB pull (the DVWA
+      # network-timeout lesson) — on Actions the DB download is reliable.
+      - name: Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+
+      - name: Trivy filesystem scan (JSON, for offline analysis)
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+
+      - name: Record run-manifest fragment (Trivy)
+        if: always()
+        run: |
+          {
+            echo "## trivy"
+            echo "action: aquasecurity/trivy-action@v0.36.0"
+            echo "scanners: vuln,secret,misconfig"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-trivy.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-trivy
+          path: manifest-trivy.txt
+          if-no-files-found: warn
+
+      - name: Upload Trivy SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Upload Trivy output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-trivy
+          path: |
+            trivy.sarif
+            trivy.json
+          if-no-files-found: warn
+
+  # -------------------------------------------------- OWASP Dependency-Check
+  # The npm-audit / composer-audit analogue DVWA had no equivalent for. To give
+  # Dependency-Check real artifacts to fingerprint (its jar analyzer is far more
+  # reliable than pom-only heuristics), copy the resolved dependency JARs first
+  # via the Maven wrapper, then scan that folder. NVD_API_KEY (optional repo
+  # secret) makes the NVD data feed much faster; without it the first DB build is
+  # slow and rate-limited — recorded as a friction point, not a blocker.
+  dependency-check:
+    name: SCA - OWASP Dependency-Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Resolve dependency JARs
+        continue-on-error: true
+        run: |
+          ./mvnw -B -ntp -DskipTests dependency:copy-dependencies \
+            -DoutputDirectory=target/dependency -DincludeScope=runtime
+          echo "resolved jars: $(find target/dependency -name '*.jar' 2>/dev/null | wc -l)"
+          find target/dependency -name '*.jar' 2>/dev/null | sed 's#.*/##' | sort | head -60
+
+      - name: Run OWASP Dependency-Check
+        continue-on-error: true
+        uses: dependency-check/Dependency-Check_Action@main
+        env:
+          # JAVA_HOME is exported by setup-java; the action uses its own JRE image
+          # but honours the NVD key when present.
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        with:
+          project: WebGoat
+          path: target/dependency
+          format: 'ALL'
+          args: >-
+            --failOnCVSS 11
+            --enableRetired
+
+      - name: Locate Dependency-Check reports
+        if: always()
+        run: |
+          mkdir -p depcheck
+          # the action writes to ${{ github.workspace }}/reports by default
+          cp -v reports/* depcheck/ 2>/dev/null || true
+          ls -la depcheck || true
+          if [ -f depcheck/dependency-check-report.json ]; then
+            echo "dependency-check vulnerabilities: $(jq '[.dependencies[]?.vulnerabilities[]?] | length' depcheck/dependency-check-report.json 2>/dev/null || echo '?')"
+          else
+            echo "::warning::dependency-check JSON report not found - check the action log"
+          fi
+
+      - name: Record run-manifest fragment (Dependency-Check)
+        if: always()
+        run: |
+          {
+            echo "## owasp dependency-check"
+            echo "action: dependency-check/Dependency-Check_Action@main"
+            echo "scanned: target/dependency (resolved runtime JARs)"
+            echo "nvd_api_key set: $([ -n \"${NVD_API_KEY}\" ] && echo yes || echo no)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > depcheck/manifest-depcheck.txt
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+      - name: Upload Dependency-Check reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-dependency-check
+          path: depcheck/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- gitleaks
+  # Working-tree secret scan. Released binary, checksum-verified, rather than the
+  # vendor action (which needs a paid licence for org-owned repos). Report written
+  # to RUNNER_TEMP, NOT into the scanned tree (the self-scan bug).
+  gitleaks:
+    name: Secrets - gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o "$asset" "${base}/${asset}"
+          curl -sSfL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${asset}\$" checksums.txt > expected-checksum.txt
+          [ -s expected-checksum.txt ] || { echo "::error::asset not in checksums file"; exit 1; }
+          sha256sum -c expected-checksum.txt
+          tar -xzf "$asset" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          mkdir -p "${RUNNER_TEMP}/gitleaks-reports"
+          echo "REPORT_DIR=${RUNNER_TEMP}/gitleaks-reports" >> "$GITHUB_ENV"
+
+      # `--exit-code 0` (not continue-on-error): gitleaks exits 1 for BOTH a
+      # finding and a real error; setting the leak exit code to 0 keeps a genuine
+      # crash fatal while a finding is not.
+      - name: gitleaks scan (working tree, SARIF + JSON)
+        run: |
+          gitleaks dir . --report-format sarif \
+            --report-path "$REPORT_DIR/gitleaks.sarif" --exit-code 0 --no-banner
+          gitleaks dir . --report-format json \
+            --report-path "$REPORT_DIR/gitleaks.json" --exit-code 0 --no-banner
+
+      - name: Verify gitleaks produced a rule-carrying report
+        if: always()
+        run: |
+          f="$REPORT_DIR/gitleaks.sarif"
+          [ -s "$f" ] || { echo "::error::gitleaks.sarif missing/empty"; exit 1; }
+          rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+          [ "${rules:-0}" -eq 0 ] && { echo "::error::gitleaks loaded zero rules"; exit 1; }
+          echo "gitleaks findings: $(jq 'length' "$REPORT_DIR/gitleaks.json" 2>/dev/null || echo '?')"
+
+      - name: Record run-manifest fragment (gitleaks)
+        if: always()
+        run: |
+          {
+            echo "## gitleaks"
+            echo "version: $(gitleaks version 2>/dev/null || echo 'n/a')"
+            echo "pass:    dir (working tree at HEAD)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > "$REPORT_DIR/manifest-gitleaks.txt"
+
+      - name: Collect reports into the workspace for upload
+        if: always()
+        run: |
+          mkdir -p gitleaks-reports
+          cp "$REPORT_DIR"/* gitleaks-reports/ 2>/dev/null || true
+
+      - name: Upload gitleaks SARIF to Security tab
+        if: always() && hashFiles('gitleaks-reports/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks-reports/gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload gitleaks reports as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: gitleaks-reports/
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------- aggregation
+  summary:
+    name: SCA summary
+    runs-on: ubuntu-latest
+    needs: [ osv-scanner, trivy, dependency-check, gitleaks ]
+    if: always()
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif
+          merge-multiple: true
+
+      - name: Count findings per SARIF file
+        run: |
+          {
+            echo "## SCA + secrets summary (WebGoat)"
+            echo ""
+            echo "Unlike DVWA, WebGoat has a real Maven manifest with intentionally"
+            echo "vulnerable dependencies (xstream 1.4.5, commons-collections 3.2.1, ...),"
+            echo "so SCA is expected to produce genuine advisories here."
+            echo ""
+            echo "| SARIF file | results |"
+            echo "|---|---|"
+            shopt -s nullglob
+            for f in sarif/*.sarif; do
+              n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "parse error")
+              echo "| $(basename "$f") | ${n} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # OSV / Trivy are rules-are-findings scanners, so liveness asserts the file
+      # EXISTS and PARSES, not that it carries rules.
+      - name: Verify each expected SARIF exists and parses
+        run: |
+          fail=0
+          for f in osv.sarif trivy.sarif; do
+            p="sarif/$f"
+            if [ ! -s "$p" ]; then
+              echo "::error::$f is missing or empty - its scanner failed silently"
+              fail=1
+              continue
+            fi
+            jq -e '.runs[0].tool.driver' "$p" >/dev/null 2>&1 || { echo "::error::$f is not valid SARIF"; fail=1; }
+          done
+          exit "$fail"

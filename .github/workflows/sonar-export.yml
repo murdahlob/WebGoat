@@ -1,0 +1,178 @@
+name: SonarCloud export - WebGoat
+
+# PHASE-3 SonarCloud RESULT-COLLECTION workflow (target 3, WebGoat / Java).
+#
+# ======================= JAVA WANTS COMPILED BYTECODE =======================
+# PLAN-008 §2: SonarCloud's Java analyzer needs COMPILED bytecode for full taint
+# analysis — automatic analysis is SHALLOWER on Java than a build-based CI scan.
+# So, unlike the DVWA (PHP) export (which just drained an automatic analysis),
+# this workflow COMPILES the project first and runs a CI-based scan with
+# `sonar.java.binaries=target/classes`, then exports the issues + hotspots.
+#
+# IMPORTANT (owner step 1.3): a SonarCloud project has EITHER automatic analysis
+# OR CI-based analysis, never both. For a deep Java scan the owner must DISABLE
+# "Automatic Analysis" on the murdahlob_WebGoat project so this CI scan is
+# accepted. If automatic analysis is left on, the scan step fails (caught by
+# continue-on-error) and the export drains whatever the shallow automatic run
+# produced — the manifest records which mode actually ran.
+#
+# SonarCloud results live on sonarcloud.io and need SONAR_TOKEN to scan/export.
+# A token-LENGTH diagnostic (never the value) distinguishes an empty/unset secret
+# from a present-but-invalid one.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sonar-export:
+    name: SonarCloud scan + export (Java)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_ORG: murdahlob
+      PINNED_SHA: c596b729866792d0e5b73330948713d5852b5ec6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c596b729866792d0e5b73330948713d5852b5ec6
+          fetch-depth: 0
+
+      - name: Set up JDK 25 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Diagnose token and resolve project key
+        id: resolve
+        run: |
+          echo "SONAR_TOKEN length: ${#SONAR_TOKEN}"
+          code=$(curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/projects/search?organization=${SONAR_ORG}" \
+            -o proj.json -w '%{http_code}')
+          echo "projects/search HTTP: $code"
+          cat proj.json || true
+          KEY=$(jq -r '.components[]? | select(.name=="WebGoat" or (.key|test("WebGoat"))) | .key' proj.json 2>/dev/null | head -1)
+          [ -z "$KEY" ] && KEY=$(jq -r '.components[0].key // empty' proj.json 2>/dev/null)
+          [ -z "$KEY" ] && KEY="${SONAR_ORG}_WebGoat"
+          echo "Resolved project key: $KEY"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Check for an existing completed analysis
+        id: check
+        run: |
+          KEY='${{ steps.resolve.outputs.key }}'
+          code=$(curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/project_analyses/search?project=${KEY}&ps=1" \
+            -o an.json -w '%{http_code}')
+          echo "project_analyses/search HTTP: $code"
+          N=$(jq -r '.analyses | length' an.json 2>/dev/null || echo 0)
+          echo "existing analyses: $N"
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+
+      # Compile main so the Java analyzer has bytecode. Not fatal on failure — if
+      # the compile breaks we still export whatever exists, but we record it.
+      - name: Compile (Maven, main only)
+        id: build
+        continue-on-error: true
+        run: |
+          ./mvnw -B -ntp -DskipTests -Dmaven.test.skip=true clean compile
+          echo "classes=$(find target/classes -name '*.class' 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+
+      # Build-based scan with bytecode. If automatic analysis is enabled on the
+      # project this step fails (mutually exclusive) — continue-on-error keeps the
+      # run alive so the export below still drains the shallow automatic results.
+      - name: Run SonarCloud scan (build-based, with bytecode)
+        id: scan
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v4
+        with:
+          args: >
+            -Dsonar.organization=${{ env.SONAR_ORG }}
+            -Dsonar.projectKey=${{ steps.resolve.outputs.key }}
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.sources=src/main
+            -Dsonar.tests=src/test
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.exclusions=target/**,.github/**,**/*.min.js
+            -Dsonar.scm.revision=${{ env.PINNED_SHA }}
+
+      - name: Wait for the Compute-Engine task (if a scan ran)
+        if: steps.scan.outcome == 'success'
+        continue-on-error: true
+        run: |
+          CE=$(sed -n 's/^ceTaskUrl=//p' .scannerwork/report-task.txt 2>/dev/null)
+          echo "ceTaskUrl=$CE"
+          [ -z "$CE" ] && { echo "no report-task.txt; skipping CE wait"; exit 0; }
+          for i in $(seq 1 60); do
+            curl -s -u "$SONAR_TOKEN:" "$CE" -o ce.json
+            ST=$(jq -r '.task.status' ce.json 2>/dev/null || echo UNKNOWN)
+            echo "attempt $i: status=$ST"
+            case "$ST" in
+              SUCCESS) echo "analysis complete"; break ;;
+              FAILED|CANCELED) echo "::warning::CE task $ST"; cat ce.json; break ;;
+            esac
+            sleep 10
+          done
+
+      - name: Export issues (paginated) and hotspots
+        run: |
+          KEY='${{ steps.resolve.outputs.key }}'
+          page=1
+          while :; do
+            curl -s -u "$SONAR_TOKEN:" \
+              "https://sonarcloud.io/api/issues/search?componentKeys=${KEY}&resolved=false&ps=500&p=${page}" \
+              -o "issues_p${page}.json"
+            total=$(jq -r '.total // 0' "issues_p${page}.json")
+            got=$(jq -r '.issues | length' "issues_p${page}.json")
+            echo "issues page ${page}: got ${got} of total ${total}"
+            fetched=$(( (page - 1) * 500 + got ))
+            { [ "$got" -eq 0 ] || [ "$fetched" -ge "$total" ]; } && break
+            page=$((page + 1))
+          done
+          jq -s '{total: (.[0].total // 0), issues: (map(.issues) | add // [])}' issues_p*.json > sonar-issues.json
+          echo "merged issues: $(jq -r '.issues | length' sonar-issues.json)"
+
+          curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/hotspots/search?projectKey=${KEY}&ps=500&p=1" \
+            -o sonar-hotspots.json
+          echo "hotspots: $(jq -r '.hotspots | length' sonar-hotspots.json 2>/dev/null || echo parse-error)"
+
+      - name: Summarise counts
+        if: always()
+        run: |
+          {
+            echo "## SonarCloud export (WebGoat / Java)"
+            echo ""
+            echo "Project key: \`${{ steps.resolve.outputs.key }}\`"
+            echo "Existing analyses at start: ${{ steps.check.outputs.count }}"
+            echo "Compiled classes: ${{ steps.build.outputs.classes }}"
+            echo "Build-based scan outcome: ${{ steps.scan.outcome }} (success = CI scan with bytecode; failure = automatic analysis likely enabled -> shallow)"
+            echo ""
+            if [ -f sonar-issues.json ]; then
+              echo "- total unresolved issues: $(jq -r '.issues | length' sonar-issues.json)"
+              echo "- VULNERABILITY: $(jq -r '[.issues[] | select(.type==\"VULNERABILITY\")] | length' sonar-issues.json)"
+              echo "- BUG: $(jq -r '[.issues[] | select(.type==\"BUG\")] | length' sonar-issues.json)"
+              echo "- CODE_SMELL: $(jq -r '[.issues[] | select(.type==\"CODE_SMELL\")] | length' sonar-issues.json)"
+            fi
+            if [ -f sonar-hotspots.json ]; then
+              echo "- SECURITY_HOTSPOT: $(jq -r '.hotspots | length' sonar-hotspots.json)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SonarCloud export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-export
+          path: |
+            sonar-issues.json
+            sonar-hotspots.json
+            proj.json
+            an.json
+          if-no-files-found: warn

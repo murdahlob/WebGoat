@@ -39,8 +39,8 @@ public class InsecureDeserializationTask implements AssignmentEndpoint {
 
     b64token = token.replace('-', '+').replace('_', '/');
 
-    try (ObjectInputStream ois =
-        new ObjectInputStream(new ByteArrayInputStream(Base64.getDecoder().decode(b64token)))) {
+    byte[] decoded = Base64.getDecoder().decode(b64token);
+    try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(decoded))) {
       before = System.currentTimeMillis();
       Object o = ois.readObject();
       if (!(o instanceof VulnerableTaskHolder)) {
